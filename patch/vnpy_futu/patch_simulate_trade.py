@@ -7,6 +7,9 @@ This patch makes the gateway fall back to polling order status and
 emitting synthesized TradeData from filled orders, restoring the native
 trade event flow without touching any strategy code.
 
+It also fixes query_history(), which uses DataFrame.append removed in
+pandas 2.x, breaking load_bar() during CTA strategy init.
+
 Real environment impact: ZERO. The fallback is double-guarded: it only
 activates when deal_list_query returns an error AND self.env is
 TrdEnv.SIMULATE, and the periodic polling self-registers only after the
@@ -120,29 +123,45 @@ EDIT2_NEW = '''    def query_trade(self) -> None:
         self.synced_orders = True
 '''
 
-# Edit 3 has been removed: the periodic polling now self-registers
-# inside query_trade (see EDIT2_NEW) and only after the first
-# deal_list_query failure, so a real account is left untouched.
+# Edit 3: pandas 2.x removed DataFrame.append, which breaks
+# query_history() used by CTA strategy init (load_bar).
+EDIT3_OLD = "                history_df = history_df.append(data, ignore_index=True)"
+EDIT3_NEW = "                history_df = pd.concat([history_df, data], ignore_index=True)"
 
-EDITS: list = [(EDIT1_OLD, EDIT1_NEW), (EDIT2_OLD, EDIT2_NEW)]
+# Each edit carries a marker substring that is unique to its new text,
+# so re-running the script skips already-applied edits instead of
+# aborting early.
+EDITS: list = [
+    (EDIT1_OLD, EDIT1_NEW, "self.traded_volume"),
+    (EDIT2_OLD, EDIT2_NEW, "query_simulate_trade"),
+    (EDIT3_OLD, EDIT3_NEW, "pd.concat([history_df, data]"),
+]
 
 
 def main() -> None:
-    """Apply the patch."""
+    """Apply the patch (idempotent per edit)."""
     path: Path = find_gateway_file()
     print(f"Patching: {path}")
 
     content: str = path.read_text(encoding="utf-8")
 
-    if "query_simulate_trade" in content:
-        print("Already patched, nothing to do.")
+    pending: list = []
+    for index, (old, new, marker) in enumerate(EDITS, start=1):
+        if marker in content:
+            print(f"Edit {index}: already applied, skipping.")
+            continue
+        pending.append((index, old, new))
+
+    if not pending:
+        print("All edits already applied, nothing to do.")
         return
 
     backup: Path = path.with_suffix(".py.bak")
-    backup.write_text(content, encoding="utf-8")
-    print(f"Backup saved: {backup}")
+    if not backup.exists():
+        backup.write_text(content, encoding="utf-8")
+        print(f"Backup saved: {backup}")
 
-    for index, (old, new) in enumerate(EDITS, start=1):
+    for index, old, new in pending:
         count: int = content.count(old)
         if count != 1:
             print(f"Edit {index} failed: pattern found {count} time(s), aborting.")
